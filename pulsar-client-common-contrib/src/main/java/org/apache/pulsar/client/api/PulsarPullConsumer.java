@@ -1,72 +1,148 @@
 package org.apache.pulsar.client.api;
 
-import java.io.IOException;
+import java.time.Duration;
 import java.util.List;
-import java.util.concurrent.TimeUnit;
+import lombok.Data;
 import org.apache.pulsar.client.admin.PulsarAdminException;
 
-public interface PulsarPullConsumer<T> {
-    /**
-     * Initializes the consumer and establishes connection to brokers.
-     *
-     * @throws PulsarClientException if client setup fails
-     * @throws PulsarAdminException if admin operations fail
-     */
-    void start() throws PulsarClientException, PulsarAdminException;
+/**
+ * Pull-based consumer interface with enhanced offset management capabilities.
+ *
+ * <p>Features:</p>
+ * <ul>
+ *   <li>Precise offset control with partition-aware operations</li>
+ *   <li>Thread-safe design for concurrent access</li>
+ *   <li>Support for both partitioned and non-partitioned topics</li>
+ *   <li>Built-in offset to message ID mapping</li>
+ * </ul>
+ *
+ * @param <T> message payload type
+ */
+public interface PulsarPullConsumer<T> extends AutoCloseable {
+    int PARTITION_NONE = -1;
+    Duration DEFAULT_OPERATION_TIMEOUT = Duration.ofSeconds(30);
 
     /**
-     * Pulls messages from specified partition starting from the given offset (inclusive).
+     * Initializes consumer resources and establishes connections.
      *
-     * @param offset     the starting offset to consume from (inclusive)
-     * @param partition  the target partition index, -1 means non-partitioned topic
-     * @param maxNum     maximum number of messages to return
-     * @param maxSize    maximum total size (bytes) of messages to return
-     * @param timeout    maximum wait time per message
-     * @param timeUnit   timeout unit
-     * @return list of messages starting from the specified offset
-     * @throws PulsarClientException if read operations fail
-     * @throws PulsarAdminException  if offset mapping fails
+     * @throws PulsarClientException if client initialization fails
      */
-    List<Message<?>> pull(long offset, int partition, int maxNum, int maxSize,
-                          int timeout, TimeUnit timeUnit)
-            throws PulsarClientException, PulsarAdminException;
+    void start() throws PulsarClientException;
 
     /**
-     * Acknowledges consumption of all messages up to and including the specified offset.
+     * Pulls messages from the specified partition starting from the given offset.
      *
-     * @param offset    the offset to acknowledge (inclusive)
-     * @param partition the target partition index, -1 means non-partitioned topic
-     * @throws PulsarClientException if acknowledgment fails
+     * @param request pull request configuration
+     * @return immutable list of messages starting from the specified offset
+     * @throws IllegalArgumentException for invalid request parameters
+     */
+    List<Message<T>> pull(PullRequest request);
+
+    /**
+     * Acknowledges all messages up to the specified offset (inclusive).
+     *
+     * @param offset target offset to acknowledge
+     * @param partition partition index (use {@link #PARTITION_NONE} for non-partitioned topics)
+     * @throws PulsarClientException for acknowledgment failures
+     * @throws IllegalArgumentException for invalid partition index
      */
     void ack(long offset, int partition) throws PulsarClientException;
 
     /**
      * Finds the latest message offset before or at the specified timestamp.
      *
-     * @param topic       target topic name
-     * @param partition the target partition index, -1 means non-partitioned topic
-     * @param timestamp   target timestamp (milliseconds since epoch)
-     * @return the closest offset where message timestamp ≤ specified timestamp
-     * @throws PulsarAdminException if message lookup fails
+     * @param partition partition index (use {@link #PARTITION_NONE} for non-partitioned topics)
+     * @param timestamp target timestamp in milliseconds
+     * @return corresponding message offset
+     * @throws PulsarAdminException for admin operation failures
+     * @throws IllegalArgumentException for invalid partition index
      */
-    long searchOffset(String topic, int partition, long timestamp) throws PulsarAdminException;
+    long searchOffset(int partition, long timestamp) throws PulsarAdminException;
 
     /**
-     * Retrieves consumption statistics for a consumer group.
+     * Retrieves consumption statistics for the specified partition.
      *
-     * @param topic      target topic name
-     * @param partition the target partition index, -1 means non-partitioned topic
-     * @param group      consumer group name
-     * @return the current consumed offset for the group
-     * @throws PulsarAdminException if statistics retrieval fails
+     * @param partition partition index (use {@link #PARTITION_NONE} for non-partitioned topics)
+     * @return current consumption offset
+     * @throws PulsarAdminException for stats retrieval failures
+     * @throws IllegalArgumentException for invalid partition index
      */
-    long getConsumeStats(String topic, Integer partition, String group) throws PulsarAdminException;
+    long getConsumeStats(int partition) throws PulsarAdminException;
 
     /**
-     * Releases all resources and closes connections.
-     * Implements AutoCloseable for try-with-resources support.
-     *
-     * @throws IOException if graceful shutdown fails
+     * Releases all resources and closes connections gracefully.
      */
-    void close() throws IOException;
+    @Override
+    void close();
+
+    /**
+     * Configuration object for pull requests.
+     */
+    @Data
+    class PullRequest {
+        private final long offset;
+        private final int partition;
+        private final int maxMessages;
+        private final int maxBytes;
+        private final Duration timeout;
+
+        private PullRequest(Builder builder) {
+            this.offset = builder.offset;
+            this.partition = builder.partition;
+            this.maxMessages = builder.maxMessages;
+            this.maxBytes = builder.maxBytes;
+            this.timeout = builder.timeout;
+        }
+
+        public static Builder builder() {
+            return new Builder();
+        }
+
+        public static class Builder {
+            private long offset = -1L;
+            private int partition = PARTITION_NONE;
+            private int maxMessages = 100;
+            private int maxBytes = 10_485_760; // 10MB
+            private Duration timeout = DEFAULT_OPERATION_TIMEOUT;
+
+            public Builder offset(long offset) {
+                this.offset = offset;
+                return this;
+            }
+
+            public Builder partition(int partition) {
+                this.partition = partition;
+                return this;
+            }
+
+            public Builder maxMessages(int maxMessages) {
+                this.maxMessages = maxMessages;
+                return this;
+            }
+
+            public Builder maxBytes(int maxBytes) {
+                this.maxBytes = maxBytes;
+                return this;
+            }
+
+            public Builder timeout(Duration timeout) {
+                this.timeout = timeout;
+                return this;
+            }
+
+            public PullRequest build() {
+                validate();
+                return new PullRequest(this);
+            }
+
+            private void validate() {
+                if (offset < 0) {
+                    throw new IllegalArgumentException("Offset must be non-negative");
+                }
+                if (maxMessages <= 0 || maxBytes <= 0) {
+                    throw new IllegalArgumentException("Max messages/bytes must be positive");
+                }
+            }
+        }
+    }
 }

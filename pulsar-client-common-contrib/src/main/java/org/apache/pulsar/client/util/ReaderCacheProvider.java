@@ -8,7 +8,7 @@ import org.apache.pulsar.client.api.Schema;
 public class ReaderCacheProvider {
     private static final Map<String, Map<Schema<?>, ReaderCache<?>>> CACHE_MAP = new ConcurrentHashMap<>();
 
-    public static <T> ReaderCache<T> getReaderCache(String brokerCluster, Schema<T> schema, PulsarClient client,
+    public static <T> ReaderCache<T> getOrCreateReaderCache(String brokerCluster, Schema<T> schema, PulsarClient client,
                                                     OffsetToMessageIdCache offsetToMessageIdCache) {
         Map<Schema<?>, ReaderCache<?>> partitionReaderCache = CACHE_MAP.computeIfAbsent(brokerCluster,
                 key -> new ConcurrentHashMap<>());

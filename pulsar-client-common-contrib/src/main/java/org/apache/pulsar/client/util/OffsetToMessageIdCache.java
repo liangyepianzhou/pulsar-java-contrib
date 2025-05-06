@@ -9,52 +9,95 @@ import java.util.concurrent.ConcurrentHashMap;
 import org.apache.pulsar.client.admin.PulsarAdmin;
 import org.apache.pulsar.client.api.MessageId;
 
+/**
+ * Cache for mapping offsets to MessageIds with the following features:
+ * - Per-partition caching with configurable size and expiration
+ * - Thread-safe cache initialization and access
+ * - Automatic cache cleanup
+ */
 public class OffsetToMessageIdCache {
-    private static final int MAX_CACHE_SIZE = 1000;
-    private static final Duration EXPIRE_AFTER_ACCESS = Duration.ofMinutes(5);
+    private static final int DEFAULT_MAX_CACHE_SIZE = 1000;
+    private static final Duration DEFAULT_EXPIRE_AFTER_ACCESS = Duration.ofMinutes(5);
 
     private final PulsarAdmin pulsarAdmin;
-    private final Map<String, LoadingCache<Long, MessageId>> caffeineCacheMap = new ConcurrentHashMap<>();
+    private final Map<String, LoadingCache<Long, MessageId>> partitionCaches = new ConcurrentHashMap<>();
+    private final int maxCacheSize;
+    private final Duration expireAfterAccess;
 
     public OffsetToMessageIdCache(PulsarAdmin pulsarAdmin) {
+        this(pulsarAdmin, DEFAULT_MAX_CACHE_SIZE, DEFAULT_EXPIRE_AFTER_ACCESS);
+    }
+
+    public OffsetToMessageIdCache(PulsarAdmin pulsarAdmin,
+                                  int maxCacheSize,
+                                  Duration expireAfterAccess) {
         this.pulsarAdmin = Objects.requireNonNull(pulsarAdmin, "PulsarAdmin must not be null");
+        this.maxCacheSize = validatePositive(maxCacheSize, "Cache size must be positive");
+        this.expireAfterAccess = Objects.requireNonNull(expireAfterAccess,
+                "Expire duration must not be null");
     }
 
     private LoadingCache<Long, MessageId> createCache(String partitionTopic) {
         return Caffeine.newBuilder()
-                .maximumSize(MAX_CACHE_SIZE)
-                .expireAfterAccess(EXPIRE_AFTER_ACCESS)
+                .maximumSize(maxCacheSize)
+                .expireAfterAccess(expireAfterAccess)
                 .recordStats()
-                .build(key -> loadMessageId(partitionTopic, key));
+                .build(offset -> loadMessageId(partitionTopic, offset));
     }
 
+    /**
+     * TODO: Implement after https://github.com/apache/pulsar/pull/24220 is merged
+     */
     private MessageId loadMessageId(String partitionTopic, Long offset) {
-//        try {
-//            // todo: waiting for https://github.com/apache/pulsar/pull/24220
-//            return  pulsarAdmin.topics().getMessageIDByOffsetAndPartitionID(partitionTopic, offset);
-//        } catch (PulsarAdminException e) {
-//            throw new CompletionException("Failed to load message ID", e);
-//        }
+        // Placeholder implementation
+        // try {
+        //     return pulsarAdmin.topics().getMessageIDByOffsetAndPartitionID(partitionTopic, offset);
+        // } catch (PulsarAdminException e) {
+        //     throw new CompletionException("Failed to load message ID for "
+        //         + partitionTopic + " offset " + offset, e);
+        // }
         return null;
     }
 
     public MessageId getMessageIdByOffset(String partitionTopic, long offset) {
-        LoadingCache<Long, MessageId> cache = caffeineCacheMap.computeIfAbsent(
-                partitionTopic,
-                this::createCache
-        );
-        return cache.get(offset);
+        return partitionCaches
+                .computeIfAbsent(partitionTopic, this::createCache)
+                .get(offset);
     }
 
     public void putMessageIdByOffset(String partitionTopic, long offset, MessageId messageId) {
-        LoadingCache<Long, MessageId> caffeineCache = caffeineCacheMap.computeIfAbsent(partitionTopic,
-                k -> createCache(partitionTopic));
-        caffeineCache.put(offset, messageId);
+        partitionCaches
+                .computeIfAbsent(partitionTopic, this::createCache)
+                .put(offset, messageId);
     }
 
+    /**
+     * Cleans up all cached entries and releases resources
+     */
     public void cleanup() {
-        for (LoadingCache<Long, MessageId> cache : caffeineCacheMap.values()) {
+        partitionCaches.values().forEach(cache -> {
+            cache.invalidateAll();
+            cache.cleanUp();
+        });
+        partitionCaches.clear();
+    }
+
+    /**
+     * Removes cache for specific partition topic
+     * @param partitionTopic topic partition to remove
+     */
+    public void removePartitionCache(String partitionTopic) {
+        LoadingCache<Long, MessageId> cache = partitionCaches.remove(partitionTopic);
+        if (cache != null) {
+            cache.invalidateAll();
             cache.cleanUp();
         }
+    }
+
+    private static int validatePositive(int value, String errorMessage) {
+        if (value <= 0) {
+            throw new IllegalArgumentException(errorMessage);
+        }
+        return value;
     }
 }

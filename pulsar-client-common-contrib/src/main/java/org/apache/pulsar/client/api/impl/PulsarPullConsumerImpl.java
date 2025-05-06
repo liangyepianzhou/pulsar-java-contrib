@@ -1,9 +1,11 @@
 package org.apache.pulsar.client.api.impl;
 
-import java.io.IOException;
+import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import org.apache.pulsar.client.admin.PulsarAdmin;
@@ -17,176 +19,252 @@ import org.apache.pulsar.client.api.PulsarClient;
 import org.apache.pulsar.client.api.PulsarClientException;
 import org.apache.pulsar.client.api.Reader;
 import org.apache.pulsar.client.api.Schema;
+import org.apache.pulsar.client.impl.MessageIdImpl;
 import org.apache.pulsar.client.util.OffsetToMessageIdCache;
 import org.apache.pulsar.client.util.OffsetToMessageIdCacheProvider;
 import org.apache.pulsar.client.util.ReaderCache;
 import org.apache.pulsar.client.util.ReaderCacheProvider;
 import org.apache.pulsar.common.partition.PartitionedTopicMetadata;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public class PulsarPullConsumerImpl<T> implements PulsarPullConsumer<T> {
+    private static final Logger log = LoggerFactory.getLogger(PulsarPullConsumerImpl.class);
+    private static final String PARTITION_SPLICER = "-partition-";
+    private static final int DEFAULT_READ_TIMEOUT_MS = 30_000;
+
     private final String topic;
     private final String subscription;
-    private final String brokerCluster;
     private final Schema<T> schema;
-    private static final String PARTITION_SPLICER = "-partition-";
-    private int partitionNum;
-
-    Map<String, Consumer<?>> consumerMap;
+    private final Map<String, Consumer<T>> consumerMap;
     private final OffsetToMessageIdCache offsetToMessageIdCache;
     private final ReaderCache<T> readerCache;
-
     private final PulsarAdmin pulsarAdmin;
     private final PulsarClient pulsarClient;
 
-    public PulsarPullConsumerImpl(String topic, String subscription, Schema<T> schema, PulsarClient client,
-                                  PulsarAdmin admin, String brokerCluster) {
-        this.topic = topic;
-        this.subscription = subscription;
-        this.brokerCluster = brokerCluster;
-        this.schema = schema;
+    private volatile int partitionCount;
+
+    public PulsarPullConsumerImpl(String topic,
+                                  String subscription,
+                                    String brokerCluster,
+                                  Schema<T> schema,
+                                  PulsarClient client,
+                                  PulsarAdmin admin) {
+        this.topic = Objects.requireNonNull(topic, "Topic must not be null");
+        this.subscription = Objects.requireNonNull(subscription, "Subscription must not be null");
+        this.schema = Objects.requireNonNull(schema, "Schema must not be null");
+        this.pulsarClient = Objects.requireNonNull(client, "PulsarClient must not be null");
+        this.pulsarAdmin = Objects.requireNonNull(admin, "PulsarAdmin must not be null");
         this.consumerMap = new ConcurrentHashMap<>();
-        this.pulsarClient = client;
-        this.pulsarAdmin = admin;
-        this.offsetToMessageIdCache = OffsetToMessageIdCacheProvider.getOffsetToMessageIdCache(admin, brokerCluster);
-        this.readerCache = ReaderCacheProvider.getReaderCache(brokerCluster, schema, client, offsetToMessageIdCache);
+        this.offsetToMessageIdCache = OffsetToMessageIdCacheProvider.getOrCreateCache(admin, brokerCluster);
+        this.readerCache = ReaderCacheProvider.getOrCreateReaderCache(brokerCluster, schema, client, offsetToMessageIdCache);
     }
 
     @Override
-    public void start() throws PulsarClientException, PulsarAdminException {
-        discoverPartition();
+    public void start() throws PulsarClientException {
+        try {
+            initializePartitions();
+        } catch (PulsarAdminException e) {
+            throw new PulsarClientException("Failed to initialize partitions", e);
+        }
     }
 
-    private void discoverPartition() throws PulsarClientException, PulsarAdminException {
-        PartitionedTopicMetadata partitionedTopicMetadata = pulsarAdmin.topics().getPartitionedTopicMetadata(topic);
-        this.partitionNum = partitionedTopicMetadata.partitions;
-        if (partitionNum == 0) {
-            Consumer<?> consumer = pulsarClient.newConsumer(schema)
-                    .topic(topic)
-                    .subscriptionName(subscription)
-                    .subscribe();
-            consumerMap.put(topic, consumer);
+    private void initializePartitions() throws PulsarAdminException, PulsarClientException {
+        PartitionedTopicMetadata metadata = pulsarAdmin.topics().getPartitionedTopicMetadata(topic);
+        this.partitionCount = metadata.partitions;
+
+        if (partitionCount == 0) {
+            subscribeToTopic(topic);
             return;
         }
 
-        for (int i = 0; i < partitionNum; i++) {
-            String partitionTopic = getPartitionTopicName(topic, i);
-            Consumer<?> consumer = pulsarClient.newConsumer(schema)
-                    .topic(partitionTopic)
-                    .subscriptionName(subscription)
-                    .subscribe();
-            consumerMap.put(partitionTopic, consumer);
+        for (int i = 0; i < partitionCount; i++) {
+            String partitionTopic = buildPartitionTopic(topic, i);
+            subscribeToTopic(partitionTopic);
         }
     }
 
+    private void subscribeToTopic(String topicName) throws PulsarClientException {
+        Consumer<T> consumer = pulsarClient.newConsumer(schema)
+                .topic(topicName)
+                .subscriptionName(subscription)
+                .subscribe();
+        consumerMap.put(topicName, consumer);
+        log.debug("Subscribed to topic: {}", topicName);
+    }
+
     @Override
-    public List<Message<?>> pull(long offset, int partition, int maxNum, int maxSize,
-                                 int timeout, TimeUnit timeUnit)
-            throws PulsarClientException {
-        List<Message<?>> messages = new ArrayList<>();
-        int totalSize = 0;
-        String partitionTopic = getPartitionTopicName(topic, partition);
-        Reader<T> reader = readerCache.getReaderByOffset(partitionTopic, offset);
+    public List<Message<T>> pull(PullRequest request) {
+        validatePullParameters(request.getMaxMessages(), request.getMaxBytes());
 
-        Message<?> lastMessage = null;
-        long startTime = System.nanoTime();
-
-        while (messages.size() < maxNum && totalSize < maxSize) {
-            long elapsed = System.nanoTime() - startTime;
-            long remainingNanos = Math.max(0, TimeUnit.NANOSECONDS.convert(timeout, timeUnit) - elapsed);
-
-            Message<?> message = reader.readNext(Math.toIntExact(TimeUnit.MILLISECONDS.convert(remainingNanos, TimeUnit.NANOSECONDS)),
-                    TimeUnit.MILLISECONDS);
-            if (message == null) break;
-            messages.add(message);
-            lastMessage = message;
-            totalSize += message.getData().length;
+        String partitionTopic = buildPartitionTopic(topic, request.getPartition());
+        Reader<T> reader = null;
+        Message<T> lastMessage = null;
+        try {
+            reader = readerCache.getReader(partitionTopic, request.getOffset());
+            List<Message<T>> messages = readMessages(reader, request.getMaxMessages(), request.getMaxBytes(),
+                    request.getTimeout());
+            lastMessage = messages.isEmpty() ? null : messages.get(messages.size() - 1);
+            return messages;
+        } finally {
+            if (reader != null) {
+                releaseReader(partitionTopic, reader, lastMessage != null ? lastMessage.getIndex().get() + 1 : request.getOffset());
+            }
         }
-        if (lastMessage != null) {
-            readerCache.putReaderByOffset(partitionTopic, lastMessage.getIndex().get() + 1, reader);
+    }
+
+    private List<Message<T>> readMessages(Reader<T> reader,
+                                          int maxMessages,
+                                          int maxBytes,
+                                          Duration timeout) {
+        List<Message<T>> messages = new ArrayList<>(Math.min(maxMessages, 1024));
+        int totalBytes = 0;
+        long deadline = System.nanoTime() + timeout.getNano();
+
+        while (messages.size() < maxMessages && totalBytes < maxBytes) {
+            long remaining = deadline - System.nanoTime();
+            if (remaining <= 0) break;
+
+            try {
+                Message<T> msg = reader.readNext(
+                        (int) Math.min(TimeUnit.NANOSECONDS.toMillis(remaining), DEFAULT_READ_TIMEOUT_MS),
+                        TimeUnit.MILLISECONDS
+                );
+                if (msg == null) break;
+
+                messages.add(msg);
+                totalBytes += msg.getData().length;
+            } catch (PulsarClientException e) {
+                log.warn("Error reading message from {}", reader.getTopic(), e);
+                break;
+            }
         }
-        return messages;
+        return Collections.unmodifiableList(messages);
     }
 
     @Override
     public void ack(long offset, int partition) throws PulsarClientException {
-        String partitionTopic = getPartitionTopicName(topic, partition);
-        Consumer<?> consumer = consumerMap.get(partitionTopic);
+        String partitionTopic = buildPartitionTopic(topic, partition);
+        Consumer<T> consumer = consumerMap.get(partitionTopic);
+        if (consumer == null) {
+            throw new PulsarClientException("Consumer not found for partition: " + partition);
+        }
+
         MessageId messageId = offsetToMessageIdCache.getMessageIdByOffset(partitionTopic, offset);
+        if (messageId == null) {
+            throw new PulsarClientException("MessageID not found for offset: " + offset);
+        }
         consumer.acknowledgeCumulative(messageId);
     }
 
     @Override
-    public long searchOffset(String topic, int partition, long timestamp) throws PulsarAdminException {
-        String partitionTopic = getPartitionTopicName(topic, partition);
+    public long searchOffset(int partition, long timestamp) throws PulsarAdminException {
+        String partitionTopic = buildPartitionTopic(topic, partition);
         MessageIdAdv messageId = (MessageIdAdv) pulsarAdmin.topics().getMessageIdByTimestamp(partitionTopic, timestamp);
-        List<Message<byte[]>> messages =  pulsarAdmin.topics()
-                .getMessagesById(partitionTopic, messageId.getLedgerId(), messageId.getEntryId());
-        if (messages == null || messages.isEmpty()) {
-            throw new IllegalArgumentException("The message is not found");
-        }
-        Message<byte[]> message = messages.get(messages.size() - 1);
-        if (message.getIndex().isEmpty()) {
-            throw new IllegalArgumentException("The message index is empty");
-        }
-        offsetToMessageIdCache.putMessageIdByOffset(partitionTopic, message.getIndex().get(), message.getMessageId());
-        return message.getIndex().get();
+        return extractMessageIndex(partitionTopic, messageId);
     }
 
     @Override
-    public long getConsumeStats(String topic, Integer partition, String group) throws PulsarAdminException {
-        String partitionTopic = getPartitionTopicName(topic, partition);
-
-        // Get partition stats using proper partition identifier
-        String messageIdString = pulsarAdmin.topics().getPartitionedInternalStats(topic)
+    public long getConsumeStats(int partition) throws PulsarAdminException {
+        String partitionTopic = buildPartitionTopic(topic, partition);
+        String messageIdStr = pulsarAdmin.topics()
+                .getPartitionedInternalStats(topic)
                 .partitions.get(partitionTopic)
                 .cursors
                 .get(subscription)
                 .markDeletePosition;
 
-        // Handle potential format errors
-        if (!messageIdString.contains(":")) {
-            throw new PulsarAdminException("Invalid message ID format: " + messageIdString);
-        }
-
-        String[] ids = messageIdString.split(":");
-        try {
-            long ledgerId = Long.parseLong(ids[0]);
-            long entryId = Long.parseLong(ids[1]);
-
-            // Use partition-specific topic to retrieve message
-            List<Message<byte[]>> messages = pulsarAdmin.topics().getMessagesById(partitionTopic, ledgerId, entryId);
-            if (messages == null || messages.isEmpty()) {
-                throw new PulsarAdminException("Message not found for offset: " + messageIdString);
-            }
-            Message<?> message = messages.get(messages.size() - 1);
-            if (message.getIndex().isEmpty()) {
-                throw new PulsarAdminException("Message index is empty for offset: " + messageIdString);
-            }
-            offsetToMessageIdCache.putMessageIdByOffset(partitionTopic, message.getIndex().get(), message.getMessageId());
-            return message.getIndex().get();
-        } catch (NumberFormatException e) {
-            throw new PulsarAdminException("Invalid message ID components: " + messageIdString, e);
-        }
+        validateMessageIdFormat(messageIdStr);
+        return processMessageId(partitionTopic, messageIdStr, partition);
     }
 
-    // Add resource cleanup method
     @Override
-    public void close() throws IOException {
-        // Close all consumers
-        for (Consumer<?> consumer : consumerMap.values()) {
-            consumer.close();
-        }
-
-        offsetToMessageIdCache.cleanup();
+    public void close() {
+        closeResources();
     }
 
-    private String getPartitionTopicName(String topic, int partition) {
-        if (partitionNum > 0 && partition < 0) {
-            throw new IllegalArgumentException("Partition index must be non-negative for partitioned topics");
-        } else if (partition >= partitionNum) {
-            throw new IllegalArgumentException("Partition index out of bounds: " + partition +
-                    " for topic " + topic + " with " + partitionNum + " partitions");
+    private void closeResources() {
+        consumerMap.values().forEach(consumer -> {
+            try {
+                consumer.close();
+            } catch (PulsarClientException e) {
+                log.warn("Failed to close consumer for topic {}", consumer.getTopic(), e);
+            }
+        });
+
+        try {
+            offsetToMessageIdCache.cleanup();
+        } catch (Exception e) {
+            log.warn("Error cleaning offset cache", e);
         }
-        return partition >= 0 ? topic + PARTITION_SPLICER + partition : topic;
+    }
+
+    // Validation helpers
+    private void validatePullParameters(int maxMessages, int maxBytes) {
+        if (maxMessages <= 0) {
+            throw new IllegalArgumentException("maxMessages must be positive");
+        }
+        if (maxBytes <= 0) {
+            throw new IllegalArgumentException("maxBytes must be positive");
+        }
+    }
+
+    private String buildPartitionTopic(String baseTopic, int partition) {
+        if (partition < 0 || (partitionCount > 0 && partition >= partitionCount)) {
+            throw new IllegalArgumentException(String.format(
+                    "Invalid partition %d for topic %s with %d partitions",
+                    partition, baseTopic, partitionCount
+            ));
+        }
+        return partitionCount == 0 ? baseTopic : baseTopic + PARTITION_SPLICER + partition;
+    }
+
+    // Common message processing logic
+    private long extractMessageIndex(String topic, MessageIdAdv messageId) throws PulsarAdminException {
+        List<Message<byte[]>> messages = pulsarAdmin.topics()
+                .getMessagesById(topic, messageId.getLedgerId(), messageId.getEntryId());
+
+        if (messages == null || messages.isEmpty()) {
+            throw new PulsarAdminException("No messages found for " + messageId);
+        }
+
+        return messages.stream()
+                .map(Message::getIndex)
+                .filter(opt -> opt.isPresent())
+                .mapToLong(opt -> {
+                    long index = opt.get();
+                    offsetToMessageIdCache.putMessageIdByOffset(topic, index, messageId);
+                    return index;
+                })
+                .findFirst()
+                .orElseThrow(() -> new PulsarAdminException("Missing message index in " + messageId));
+    }
+
+    private void validateMessageIdFormat(String messageIdStr) throws PulsarAdminException {
+        if (!messageIdStr.contains(":")) {
+            throw new PulsarAdminException("Invalid message ID format: " + messageIdStr);
+        }
+    }
+
+    private long processMessageId(String topic, String messageIdStr, int partition) throws PulsarAdminException {
+        String[] parts = messageIdStr.split(":");
+        try {
+            long ledgerId = Long.parseLong(parts[0]);
+            long entryId = Long.parseLong(parts[1]);
+            MessageIdImpl messageId = new MessageIdImpl(ledgerId, entryId, partition);
+            return extractMessageIndex(topic, messageId);
+        } catch (NumberFormatException e) {
+            throw new PulsarAdminException("Invalid ID components: " + messageIdStr, e);
+        }
+    }
+
+    private void releaseReader(String topicPartition, Reader<T> reader, long nextOffset) {
+        try {
+            if (reader.isConnected()) {
+                readerCache.releaseReader(topicPartition, nextOffset, reader);
+            }
+        } catch (Exception e) {
+            log.warn("Error releasing reader for {}", topicPartition, e);
+        }
     }
 }
